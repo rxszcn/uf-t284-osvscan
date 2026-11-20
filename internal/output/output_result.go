@@ -546,19 +546,87 @@ func processVulnGroups(vulnPkg models.PackageVulns) (map[string]VulnResult, map[
 }
 
 // updateVuln updates each vulnerability info in vulnMap from the details of vulnPkg.Vulnerabilities.
+//
+// vulnMap holds one entry per vulnerability group, keyed by the group's
+// representative ID, while fix events may be carried by any member record of
+// the group. Fix information is therefore aggregated across all member records
+// and backfilled onto the group's entry, so a fix published in only one of the
+// group's advisories is never silently dropped: a group is fixable if any
+// member record carries a fix event for the installed package, and the group's
+// fixed version is the highest of the member records' next fix versions, so
+// that upgrading to it resolves every member advisory. Descriptions keep
+// coming from the group's representative record only.
 func updateVuln(vulnMap map[string]VulnResult, vulnPkg models.PackageVulns) {
+	// Map every vulnerability ID to the representative ID of its group, so fix
+	// information from non-representative records is backfilled onto the
+	// group's single output entry.
+	representativeID := make(map[string]string)
+	for _, group := range vulnPkg.Groups {
+		for _, id := range group.IDs {
+			representativeID[id] = group.IDs[0]
+		}
+	}
+
 	for _, vuln := range vulnPkg.Vulnerabilities {
 		fixable, fixedVersion := getNextFixVersion(vuln.GetAffected(), vulnPkg.Package.Version, vulnPkg.Package.Name, vulnPkg.Package.Ecosystem)
-		if outputVuln, exist := vulnMap[vuln.GetId()]; exist {
-			outputVuln.FixedVersion = fixedVersion
-			outputVuln.IsFixable = fixable
+
+		id, ok := representativeID[vuln.GetId()]
+		if !ok {
+			id = vuln.GetId()
+		}
+
+		outputVuln, exist := vulnMap[id]
+		if !exist {
+			continue
+		}
+
+		if vuln.GetId() == id {
 			outputVuln.Description = vuln.GetSummary()
 			if outputVuln.Description == "" {
 				outputVuln.Description = vuln.GetDetails()
 			}
-			vulnMap[vuln.GetId()] = outputVuln
 		}
+
+		if fixable {
+			if !outputVuln.IsFixable {
+				outputVuln.FixedVersion = fixedVersion
+			} else {
+				outputVuln.FixedVersion = maxFixVersion(vulnPkg.Package.Ecosystem, outputVuln.FixedVersion, fixedVersion)
+			}
+			outputVuln.IsFixable = true
+		} else if outputVuln.FixedVersion == "" {
+			// Keep the placeholder ("No fix available" or "N/A") for groups with
+			// no fix in any member record, matching the previous behavior. The
+			// placeholder only depends on the installed version, so it is the
+			// same for every record of this package.
+			outputVuln.FixedVersion = fixedVersion
+		}
+
+		vulnMap[id] = outputVuln
 	}
+}
+
+// maxFixVersion returns the higher of two fixed versions for the given
+// ecosystem. Both versions are expected to be parsable, as they come from fix
+// events that getNextFixVersion has already parsed; if either fails to parse,
+// the existing version is kept.
+func maxFixVersion(ecosystem string, a, b string) string {
+	ecosystemPrefix, _, _ := strings.Cut(ecosystem, ":")
+	va, err := semantic.Parse(a, ecosystemPrefix)
+	if err != nil {
+		return b
+	}
+
+	order, err := va.CompareStr(b)
+	if err != nil {
+		return a
+	}
+
+	if order < 0 {
+		return b
+	}
+
+	return a
 }
 
 func getVulnList(vulnMap map[string]VulnResult) []VulnResult {
